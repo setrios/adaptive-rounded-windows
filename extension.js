@@ -27,6 +27,11 @@
  * shadow are destroyed but signals + ActorData stay, so the next geometry
  * change can re-add the effect (unmaximize, fullscreen exit).
  *
+ * Shadow visibility is owned by syncShadowVisibility(): hidden whenever the
+ * WindowActor is transformed (animations), shown — repositioned — in the
+ * same frame the actor returns to identity.  The actor's transforms are
+ * deliberately NOT mirrored onto the shadow (see shadowShouldBeVisible).
+ *
  * disable()
  *   ├─ disableEffect()    → removeEffectFrom() every actor
  *   └─ uninitPrefs()
@@ -34,7 +39,6 @@
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
@@ -59,7 +63,6 @@ const SHADOW_PADDING          = 80;   // extra pixels around the shadow actor
 //
 // ActorData = {
 //   shadow         : St.Bin | null,
-//   propertyBindings: GObject.Binding[],
 //   signalsAttached : boolean,
 //   timeoutId      : GLib.Source | 0,
 //   laterId        : number,            // pending BEFORE_REDRAW refresh (0 = none)
@@ -496,6 +499,49 @@ function positionShadow(actor, shadow, geom = null) {
     }
 }
 
+/**
+ * The shadow is only correct when the window actor is at rest.  During
+ * animated transitions (minimize/unminimize, maximize size-change, …) the
+ * shell eases the actor's position/scale/translation; the shadow is anchored
+ * to the static frame rect and cannot follow those transforms — mirroring
+ * them via property bindings is geometrically wrong because shadow and actor
+ * have different sizes and origins (that mirroring caused the "shadow drifts
+ * in from the top-left" artifact).  So: hidden while transformed, shown at
+ * identity.
+ */
+function shadowShouldBeVisible(actor) {
+    return actor.visible &&
+        actor.scale_x === 1 && actor.scale_y === 1 &&
+        actor.translation_x === 0 && actor.translation_y === 0;
+}
+
+/**
+ * Single authority for shadow visibility, driven by the actor's
+ * transform/visibility notify signals.  The reveal happens synchronously in
+ * the same tick the animation lands on identity, before that frame is
+ * painted — the shadow pops in together with the window's resting frame.
+ *
+ * Exceptions that may force-hide outside this function: the 'minimize'
+ * handler (magic-lamp minimize deforms the actor without touching
+ * scale/translation) and the magic-lamp unminimize path, whose timer also
+ * force-shows when the lamp finishes.
+ */
+function syncShadowVisibility(actor) {
+    const data = _actorMap.get(actor);
+    if (!data?.shadow) return;
+
+    const show = shadowShouldBeVisible(actor);
+    if (show === data.shadow.visible) return;
+
+    if (show) {
+        // Geometry may have changed while hidden
+        positionShadow(actor, data.shadow);
+        data.shadow.show();
+    } else {
+        data.shadow.hide();
+    }
+}
+
 /** Create and insert a custom shadow St.Bin below the window actor. */
 function createShadow(actor) {
     // Outer bin: provides extra padding so the shadow can extend outside
@@ -648,7 +694,6 @@ function ensureActorData(actor) {
     if (!data) {
         data = {
             shadow: null,
-            bindings: [],
             connections: [],
             signalsAttached: false,
             timeoutId: 0,
@@ -698,28 +743,13 @@ function onAddEffect(actor) {
     target.add_effect_with_name(ROUNDED_CORNERS_EFFECT, new RoundedCornersEffect());
 
     let shadow = null;
-    let bindings = [];
-
-    if (getB('custom-shadow')) {
+    if (getB('custom-shadow'))
         shadow = createShadow(actor);
-
-        // Mirror visibility / transform from window to shadow.
-        // NOTE: never add 'x'/'y' here — the shadow's position is owned by
-        // positionShadow() (frame-rect anchoring).  Binding position to the
-        // WindowActor would silently override it and resurrect the
-        // Chromium/Electron shadow-offset bug.
-        for (const prop of ['pivot-point', 'translation-x', 'translation-y',
-                             'scale-x', 'scale-y', 'visible']) {
-            bindings.push(actor.bind_property(prop, shadow, prop,
-                GObject.BindingFlags.SYNC_CREATE));
-        }
-    }
 
     // Reuses the entry on re-add after a soft removal (unmaximize etc.) so
     // the still-connected per-window signals are preserved.
     const data = ensureActorData(actor);
     data.shadow = shadow;
-    data.bindings = bindings;
     data.lastScale = 0;
     data.lastShadowRect = null;
     data.lastShadowStyle = null;
@@ -730,6 +760,9 @@ function onAddEffect(actor) {
     // per-window triggers, not only those that went through applyEffectTo().
     attachWindowSignals(actor);
     refreshRoundedCorners(actor);
+    // The window may be mid-animation right now (e.g. mapped during
+    // unminimize) — let the visibility authority decide the initial state.
+    syncShadowVisibility(actor);
 }
 
 /**
@@ -766,11 +799,6 @@ function onRemoveEffect(actor, keepSignals = false) {
         }
         data.connections = [];
     }
-
-    // Unbind property mirrors (they target the shadow, which is destroyed)
-    for (const b of data.bindings)
-        b.unbind();
-    data.bindings = [];
 
     // Remove and destroy the custom shadow actor
     if (data.shadow) {
@@ -940,6 +968,16 @@ function attachWindowSignals(actor) {
     // Monitor / workspace change → scale may have changed, full refresh
     addWinConn(win, 'workspace-changed', queue);
 
+    // Transform / visibility watcher: hide the shadow while the actor is
+    // animated (minimize, unminimize, maximize size-change, extension
+    // effects) and reveal it — repositioned — the moment it is at rest.
+    // These fire per animation frame; syncShadowVisibility early-outs when
+    // the state is unchanged, so the steady cost is a few property reads.
+    const sync = () => { if (actor.metaWindow) syncShadowVisibility(actor); };
+    for (const prop of ['scale-x', 'scale-y',
+                        'translation-x', 'translation-y', 'visible'])
+        addWinConn(actor, `notify::${prop}`, sync);
+
     if (data)
         data.signalsAttached = true;
 }
@@ -1029,8 +1067,9 @@ function enableEffect() {
     addConnection(global.windowManager, 'destroy',
         (_, actor) => removeEffectFrom(actor));
 
-    // Minimise: always hide shadow + disable effect to prevent the white
-    // background of the shadow actor from showing during the animation.
+    // Minimise: hide the shadow up front (covers magic-lamp minimize, which
+    // deforms the actor without touching scale/translation, so the transform
+    // watcher cannot see it) and disable the corner effect for the animation.
     addConnection(global.windowManager, 'minimize',
         (_, actor) => {
             const data = _actorMap.get(actor);
@@ -1040,8 +1079,12 @@ function enableEffect() {
             if (fx) fx.enabled = false;
         });
 
-    // Unminimise: restore shadow + effect.  For the Magic-Lamp extension,
-    // wait until the animation is nearly finished before showing the shadow.
+    // Unminimise: restore the corner effect.  The shadow is NOT shown here —
+    // the transform watcher (syncShadowVisibility) reveals it in the same
+    // frame the unminimize animation lands, avoiding the drift artifact of a
+    // shadow visible mid-animation.  For the Magic-Lamp extension the actor
+    // is deformed with scale/translation untouched, so wait until the lamp
+    // animation is nearly finished before showing the shadow.
     addConnection(global.windowManager, 'unminimize',
         (_, actor) => {
             const data = _actorMap.get(actor);
@@ -1063,9 +1106,7 @@ function enableEffect() {
                 return;
             }
 
-            // Standard unminimise (no magic lamp)
-            if (data?.shadow)
-                data.shadow.visible = true;
+            // Standard unminimise: the watcher shows the shadow at rest
             if (fx) fx.enabled = true;
         });
 
