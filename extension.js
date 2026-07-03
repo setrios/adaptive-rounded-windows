@@ -13,22 +13,32 @@
  *        └─ applyEffectTo() every existing window actor
  *
  * applyEffectTo(actor)
- *   ├─ connect per-window signals  (size, texture size, fullscreen, focus,
+ *   ├─ connect per-window signals  (actor size, texture size, win size /
+ *   │                               position, fullscreen, focus,
  *   │                               workspace-changed)
  *   └─ onAddEffect(actor)
  *        ├─ add RoundedCornersEffect to the actor / surface
  *        ├─ create custom shadow St.Bin (below the actor in windowGroup)
  *        └─ refreshRoundedCorners()
  *
+ * Geometry triggers coalesce through queueRefresh() into one
+ * refreshRoundedCorners() per frame (Meta BEFORE_REDRAW later).  Skipped
+ * windows (maximized/fullscreen/blacklisted) are soft-removed: effect and
+ * shadow are destroyed but signals + ActorData stay, so the next geometry
+ * change can re-add the effect (unmaximize, fullscreen exit).
+ *
+ * Shadow visibility is owned by syncShadowVisibility(): hidden whenever the
+ * WindowActor is transformed (animations), shown - repositioned - in the
+ * same frame the actor returns to identity.  The actor's transforms are
+ * deliberately NOT mirrored onto the shadow (see shadowShouldBeVisible).
+ *
  * disable()
  *   ├─ disableEffect()    → removeEffectFrom() every actor
  *   └─ uninitPrefs()
  */
 
-import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
@@ -53,9 +63,12 @@ const SHADOW_PADDING          = 80;   // extra pixels around the shadow actor
 //
 // ActorData = {
 //   shadow         : St.Bin | null,
-//   propertyBindings: GObject.Binding[],
 //   signalsAttached : boolean,
-//   timeoutId      : GLib.Source | 0,
+//   laterId        : number,            // pending BEFORE_REDRAW refresh (0 = none)
+//   lastScale      : number,            // scaleFactor at last shadow placement
+//   lastShadowRect : {x,y,w,h} | null,  // last applied shadow geometry
+//   lastShadowStyle: string | null,     // style-string caches (skip identical
+//   lastInnerStyle : string | null,     //   inline-CSS reassignment)
 // }
 // ─────────────────────────────────────────────────────────────────────────────
 let _settings       = null;
@@ -176,20 +189,21 @@ function getWindowIdentifiers(win) {
     return [...identifiers];
 }
 
-function isListedWindow(identifiers, list) {
-    const lookup = new Set(
-        identifiers
-            .map(id => normalizeAppId(id))
-            .filter(Boolean),
-    );
+// Normalized exception list, cached between settings changes: shouldSkip()
+// runs once per coalesced refresh (per frame during resizes), so rebuilding
+// the Set from GSettings on every call is wasted work.
+let _blacklistCache = null;
 
-    for (const item of list) {
-        const normalized = normalizeAppId(item);
-        if (normalized && lookup.has(normalized))
-            return true;
+function getBlacklist() {
+    if (!_blacklistCache) {
+        _blacklistCache = new Set(
+            getS('blacklist').map(normalizeAppId).filter(Boolean));
     }
+    return _blacklistCache;
+}
 
-    return false;
+function isListedWindow(identifiers, listSet) {
+    return identifiers.some(id => listSet.has(normalizeAppId(id)));
 }
 
 function getAppType(win) {
@@ -220,7 +234,7 @@ function getAppType(win) {
 }
 
 /** True when this window should NOT get rounded corners. */
-function shouldSkip(win) {
+function shouldSkip(win, cfg = null) {
     const identifiers = getWindowIdentifiers(win);
     if (identifiers.some(id => ['com.rastersoft.ding', 'ding'].includes(normalizeAppId(id))))
         return true;
@@ -234,9 +248,8 @@ function shouldSkip(win) {
     //     listed windows are EXCLUDED (blacklist)
     //   Whitelist mode (whitelist-mode = true):
     //     only listed windows are INCLUDED, all others are excluded
-    const blacklist     = getS('blacklist');
     const whitelistMode = getB('whitelist-mode');
-    const isListed      = isListedWindow(identifiers, blacklist);
+    const isListed      = isListedWindow(identifiers, getBlacklist());
 
     if (whitelistMode && !isListed)
         return true;   // whitelist mode: skip apps not in the list
@@ -251,8 +264,11 @@ function shouldSkip(win) {
         return true;
 
     // Skip maximised / fullscreen windows unless the user explicitly wants
-    // rounded corners in those states
-    const cfg = buildConfig();
+    // rounded corners in those states.
+    // NOTE: skipping destroys the shadow along with the effect, so the
+    // 'keep-shadow-maximized' setting only has an effect when
+    // 'keep-rounded-maximized' is also enabled (see refreshShadowStyle).
+    cfg = cfg ?? buildConfig();
     const isMax  = win.maximizedHorizontally || win.maximizedVertically;
     const isFull = win.fullscreen;
 
@@ -380,7 +396,7 @@ function computeBounds(actor) {
     const target = targetActor(actor) ?? actor;
     const targetW = target.width;
     const targetH = target.height;
-    
+
     const [dx, dy, dw, dh] = contentOffset(win);
     // The frame area starts at (dx, dy) inside the buffer actor, because dx/dy
     // is the difference between the visible frame and the underlying buffer.
@@ -413,6 +429,184 @@ function boxShadowCss(sc, scale) {
     return `box-shadow: ${x}px ${y}px ${blur}px ${spread}px rgba(0,0,0,${alpha})`;
 }
 
+/**
+ * Shared per-pass geometry for the shadow helpers.  Computed once in
+ * refreshRoundedCorners() and passed down so positionShadow() and
+ * refreshShadowClip() can never disagree on pad/frame (the clip's
+ * [pad, pad] origin is only valid if both use identical values).
+ */
+function shadowGeometry(win) {
+    const sc = scaleFactor(win);
+    return { sc, pad: SHADOW_PADDING * sc, frame: win.get_frame_rect() };
+}
+
+/**
+ * Squircle corner radius + exponent in scaled pixels, with the max-radius
+ * clamp, for a window whose content area is (frameW − padding) × (frameH −
+ * padding).  Shared by refreshShadowClip() (the shader clip) and
+ * refreshShadowStyle() (the CSS border-radius) so the shadow's transparent
+ * corners always trace exactly the clipped contour - the coupling CLAUDE.md
+ * requires.  RoundedCornersEffect.updateUniforms() keeps its own copy because
+ * it derives bounds from the target-actor allocation, not the frame rect.
+ */
+function squircleRadius(cfg, sc, frameW, frameH) {
+    let exponent = cfg.smoothing * 10 + 2;
+    let radius   = cfg.cornerRadius * sc * 0.5 * exponent;
+
+    const contentW = frameW - (cfg.padding.left + cfg.padding.right) * sc;
+    const contentH = frameH - (cfg.padding.top  + cfg.padding.bottom) * sc;
+    const maxR = Math.min(contentW, contentH) / 2;
+    if (maxR > 0 && radius > maxR) {
+        exponent *= maxR / radius;
+        radius    = maxR;
+    }
+    return { radius, exponent };
+}
+
+/**
+ * Coalesce refresh triggers into one refreshRoundedCorners() run per frame,
+ * executed just before the next paint.  A single geometry change fires
+ * several signals (actor notify::size, texture size-changed, win
+ * size-changed); running the refresh once and late keeps shadow position,
+ * clip uniforms and style atomic within the frame and avoids duplicate
+ * GSettings/uniform work on the compositor thread.
+ */
+function queueRefresh(actor) {
+    const data = _actorMap.get(actor);
+    if (!data) {
+        refreshRoundedCorners(actor);
+        return;
+    }
+    if (data.laterId) return;
+
+    data.laterId = global.compositor.get_laters().add(
+        Meta.LaterType.BEFORE_REDRAW, () => {
+            data.laterId = 0;
+            if (actor.metaWindow)
+                refreshRoundedCorners(actor);
+            return GLib.SOURCE_REMOVE;
+        });
+}
+
+/**
+ * Anchor the shadow actor to the window's frame rect in global (stage)
+ * coordinates, padded by SHADOW_PADDING on every side.
+ *
+ * The frame rect is authoritative from Mutter and independent of how the
+ * WindowActor lays out its children.  Anchoring to the WindowActor with
+ * BindConstraint + contentOffset() breaks for clients whose buffer rect
+ * differs from their frame rect (Chromium/Electron on Wayland draw their
+ * own CSD shadow margins), because the WindowActor origin does not follow
+ * the buffer-rect convention those offsets assume.
+ */
+function positionShadow(actor, shadow, geom = null) {
+    const win = actor.metaWindow;
+    if (!win || !shadow) return;
+
+    const { sc, pad, frame } = geom ?? shadowGeometry(win);
+    const x = frame.x - pad;
+    const y = frame.y - pad;
+    const w = frame.width  + 2 * pad;
+    const h = frame.height + 2 * pad;
+
+    // Skip redundant calls: position-changed fires every frame during a
+    // drag, and Clutter does not short-circuit identical set_size values.
+    const data = _actorMap.get(actor);
+    const last = data?.lastShadowRect;
+    if (!last || last.x !== x || last.y !== y)
+        shadow.set_position(x, y);
+    if (!last || last.w !== w || last.h !== h)
+        shadow.set_size(w, h);
+
+    if (data) {
+        data.lastShadowRect = { x, y, w, h };
+        data.lastScale = sc;
+    }
+}
+
+/**
+ * The shadow is only correct when the window actor is at rest.  During
+ * animated transitions (minimize/unminimize, maximize size-change, …) the
+ * shell eases the actor's position/scale/translation; the shadow is anchored
+ * to the static frame rect and cannot follow those transforms - mirroring
+ * them via property bindings is geometrically wrong because shadow and actor
+ * have different sizes and origins (that mirroring caused the "shadow drifts
+ * in from the top-left" artifact).  So: hidden while transformed, shown at
+ * identity.
+ */
+// Tolerances for "the actor is at rest": interrupted transitions or other
+// extensions can leave tiny residual transforms (e.g. scale 0.999999); with
+// strict equality the shadow would then stay hidden forever.
+const SCALE_EPSILON       = 1e-3;
+const TRANSLATION_EPSILON = 0.5;   // half a logical pixel
+
+function shadowShouldBeVisible(actor) {
+    return actor.visible &&
+        !actor.metaWindow?.minimized &&
+        Math.abs(actor.scale_x - 1) < SCALE_EPSILON &&
+        Math.abs(actor.scale_y - 1) < SCALE_EPSILON &&
+        Math.abs(actor.translation_x) < TRANSLATION_EPSILON &&
+        Math.abs(actor.translation_y) < TRANSLATION_EPSILON;
+}
+
+/**
+ * Single authority for shadow visibility, driven by the actor's
+ * transform/visibility notify signals.  The reveal happens synchronously in
+ * the same tick the animation lands on identity, before that frame is
+ * painted - the shadow pops in together with the window's resting frame.
+ *
+ * Exceptions that may force-hide outside this function: the 'minimize'
+ * handler (magic-lamp minimize deforms the actor without touching
+ * scale/translation) and the magic-lamp unminimize path, whose timer also
+ * force-shows when the lamp finishes.
+ */
+function syncShadowVisibility(actor) {
+    const data = _actorMap.get(actor);
+    if (!data?.shadow) return;
+
+    const show = shadowShouldBeVisible(actor);
+    if (show === data.shadow.visible) return;
+
+    if (show) {
+        // The monitor scale may have changed while hidden (e.g. revealed on
+        // a different-scale monitor): queue a full refresh - it runs before
+        // this frame paints, so clip and style land coherent with the scale.
+        const win = actor.metaWindow;
+        if (win && data.lastScale && data.lastScale !== scaleFactor(win))
+            queueRefresh(actor);
+
+        // Geometry and opacity may have changed while hidden
+        positionShadow(actor, data.shadow);
+        data.shadow.opacity = actor.opacity;
+        data.shadow.show();
+    } else {
+        data.shadow.hide();
+    }
+}
+
+/** Reset the per-window shadow caches (forces the next refresh to reapply). */
+function resetShadowCaches(data) {
+    data.lastScale = 0;
+    data.lastShadowRect = null;
+    data.lastShadowStyle = null;
+    data.lastInnerStyle = null;
+}
+
+/** Remove and destroy a window's shadow actor, if any. */
+function destroyShadow(data) {
+    if (!data.shadow) return;
+    try {
+        if (data.shadow.get_parent())
+            global.windowGroup.remove_child(data.shadow);
+        data.shadow.clear_effects();
+        data.shadow.destroy();
+    } catch (_) {
+        // Shadow actor may already be destroyed
+    }
+    data.shadow = null;
+    resetShadowCaches(data);
+}
+
 /** Create and insert a custom shadow St.Bin below the window actor. */
 function createShadow(actor) {
     // Outer bin: provides extra padding so the shadow can extend outside
@@ -426,44 +620,32 @@ function createShadow(actor) {
     inner.add_style_class_name('rwc-shadow');
     shadow.set_child(inner);
 
-    // Bind x, y, width, height to the window actor (with padding offsets)
-    // The window frame is offset from the actor by `contentOffset` (dx, dy).
-    // We pad the shadow actor by SHADOW_PADDING.
-    const win = actor.metaWindow;
-    const sc = scaleFactor(win);
-    const pad = SHADOW_PADDING * sc;
-
-    const [dx, dy, dw, dh] = contentOffset(win);
-    const offsets = [dx - pad, dy - pad, dw + 2 * pad, dh + 2 * pad];
-
-    for (let i = 0; i < 4; i++) {
-        shadow.add_constraint(new Clutter.BindConstraint({
-            source:     actor,
-            coordinate: i,
-            offset:     offsets[i],
-        }));
-    }
-
     // Clip-shadow effect prevents shadow from showing inside the window
     shadow.add_effect_with_name(CLIP_SHADOW_EFFECT, new ClipShadowEffect());
 
+    // Match the window's current opacity (kept in sync by the watcher)
+    shadow.opacity = actor.opacity;
+
     global.windowGroup.insert_child_below(shadow, actor);
 
-    refreshShadowStyle(actor, shadow);
+    // Position, style, clip and visibility are applied by the caller's
+    // refreshRoundedCorners()/syncShadowVisibility() pass in the same tick
+    // (no paint happens in between), where the ActorData caches exist.
     return shadow;
 }
 
 /** Update the CSS style of an existing shadow actor. */
-function refreshShadowStyle(actor, shadowActor) {
+function refreshShadowStyle(actor, shadowActor, geom = null, cfg = null) {
     if (!shadowActor) return;
 
-    const win        = actor.metaWindow;
-    const sc         = scaleFactor(win);
+    const win = actor.metaWindow;
+    geom = geom ?? shadowGeometry(win);
+    cfg  = cfg  ?? buildConfig();
+
     const origScale  = St.ThemeContext.get_for_stage(global.stage).scale_factor;
-    const cssScale   = sc / origScale;
+    const cssScale   = geom.sc / origScale;
 
     const pad    = SHADOW_PADDING * cssScale;
-    const cfg    = buildConfig();
     const scfg   = shadowConfig(win.appears_focused);
 
     // Compute the CSS border-radius to match the shader's squircle.
@@ -472,9 +654,17 @@ function refreshShadowStyle(actor, shadowActor) {
     // A squircle extends further along diagonals than a circle of the same radius,
     // so using the shader's radius for the CSS guarantees the transparent background
     // never shows through the shader's transparent corners.
-    const exponent    = cfg.smoothing * 10 + 2;
-    const shaderR     = cfg.cornerRadius * 0.5 * exponent;
-    const radius      = shaderR * cssScale;
+    //
+    // The clamp MUST mirror refreshShadowClip()/updateUniforms() exactly, so
+    // compute it in the same scaled-pixel space (radius and bounds inset by
+    // padding*sc) and only then convert to CSS px.  Doing the clamp in logical
+    // px here would use a different threshold when sc≠1 (integer HiDPI) and the
+    // CSS corner would no longer coincide with the clipped corner.  The
+    // squircle exponent does not enter the CSS (border-radius is circular).
+    const { radius: radiusScaled } =
+        squircleRadius(cfg, geom.sc, geom.frame.width, geom.frame.height);
+    // scaled px → CSS px (rendered size = radius * origScale = radiusScaled)
+    const radius = radiusScaled / origScale;
 
     const inner = shadowActor.get_first_child();
     if (!inner) return;
@@ -484,12 +674,12 @@ function refreshShadowStyle(actor, shadowActor) {
     const isFull = win.fullscreen;
     const hide   = (isMax || isFull) && !getB('keep-shadow-maximized');
 
-    shadowActor.style = `padding: ${pad}px;`;
+    const shadowStyle = `padding: ${pad}px;`;
 
-    // Use transparent background — NEVER white.  The box-shadow alone provides
+    // Use transparent background - NEVER white.  The box-shadow alone provides
     // the visual shadow.  A white background would bleed through the shader's
     // transparent squircle corners because CSS border-radius is circular.
-    inner.style = hide
+    const innerStyle = hide
         ? 'opacity: 0;'
         : `background: transparent;
            border-radius: ${radius}px;
@@ -498,6 +688,20 @@ function refreshShadowStyle(actor, shadowActor) {
                    ${cfg.padding.right  * cssScale}px
                    ${cfg.padding.bottom * cssScale}px
                    ${cfg.padding.left   * cssScale}px;`;
+
+    // The style strings only depend on config/focus/maximize/scale - not on
+    // the frame geometry - so during resizes and drags they are identical
+    // every frame.  Skip the assignment then: setting inline style forces a
+    // CSS re-parse and relayout even when the string is unchanged.
+    const data = _actorMap.get(actor);
+    if (data?.lastShadowStyle !== shadowStyle) {
+        shadowActor.style = shadowStyle;
+        if (data) data.lastShadowStyle = shadowStyle;
+    }
+    if (data?.lastInnerStyle !== innerStyle) {
+        inner.style = innerStyle;
+        if (data) data.lastInnerStyle = innerStyle;
+    }
 }
 
 /** Update the ClipShadowEffect bounds for a shadow actor.
@@ -506,65 +710,44 @@ function refreshShadowStyle(actor, shadowActor) {
  * so the shadow is transparent exactly where the rounded corners are, with
  * pixel-perfect anti-aliasing along the curved edge.
  */
-function refreshShadowClip(actor, shadowActor) {
+function refreshShadowClip(actor, shadowActor, geom = null, cfg = null) {
     if (!shadowActor) return;
 
     const effect = shadowActor.get_effect(CLIP_SHADOW_EFFECT);
     if (!effect) return;
 
     // Window content rect within the shadow actor in pixel coordinates.
-    // Must mirror exactly the same coordinate system used by computeBounds().
-    // The shadow actor is positioned via BindConstraint to the WindowActor,
-    // so all bounds here are expressed in WindowActor coordinates + pad offset.
+    // positionShadow() places the shadow at (frame - pad) sized
+    // (frame + 2*pad), so the window frame maps exactly to [pad, pad] in
+    // shadow-actor-local coordinates.  Compute sw/sh from the frame rect
+    // rather than reading shadowActor.width / shadowActor.height: the
+    // allocation is resolved on the next Clutter layout pass and can still
+    // be 0 on the very first call (deferred applyEffectTo path for
+    // Qt / OpenGL X11 windows such as VirtualBox).
     const win = actor.metaWindow;
-    const sc  = scaleFactor(win);
-    const pad = SHADOW_PADDING * sc;
+    const { sc, pad, frame } = geom ?? shadowGeometry(win);
+    cfg = cfg ?? buildConfig();
 
-    // Compute shadow actor dimensions directly from the WindowActor rather than
-    // reading shadowActor.width / shadowActor.height.  BindConstraints are
-    // resolved on the next Clutter layout pass, so the shadow actor's allocated
-    // size is still 0 on the very first call — this is the root cause of the
-    // gray-rectangle bug on Qt / OpenGL X11 windows (VirtualBox etc.) that go
-    // through the deferred applyEffectTo path (waiting for notify::size).
-    // createShadow() sets BindConstraint offsets [dx-pad, dy-pad, dw+2*pad,
-    // dh+2*pad], so shadow dimensions = actor.{width,height} + {dw,dh} + 2*pad.
-    const [, , dw, dh] = contentOffset(win);
-    const sw = actor.width  + dw + 2 * pad;
-    const sh = actor.height + dh + 2 * pad;
-    if (sw <= 0 || sh <= 0) return;
+    // A momentarily 0-sized frame (window mapped before its first allocation)
+    // would produce inverted clip bounds - skip until real geometry arrives.
+    if (frame.width <= 0 || frame.height <= 0) return;
 
-    const cfg    = buildConfig();
-    const outerR = cfg.cornerRadius * sc;
+    const sw = frame.width  + 2 * pad;
+    const sh = frame.height + 2 * pad;
 
-    // Use the same exponent / radius formulae as RoundedCornersEffect
-    // so the clip contour is identical to the rounded corners shader.
-    let exponent = cfg.smoothing * 10 + 2;
-    let radius   = outerR * 0.5 * exponent;
+    // Squircle radius/exponent (clamped) shared with refreshShadowStyle().
+    const { radius, exponent } =
+        squircleRadius(cfg, sc, frame.width, frame.height);
 
-    // The shadow actor is positioned via BindConstraint to the WindowActor 
-    // with offset: [dx - pad, dy - pad].
-    // So the window's logical frame (which starts at dx, dy) maps exactly 
-    // to [pad, pad] in the shadow actor's local coordinates.
-    // The width/height of the frame is (actor.width + dw).
-    const rawX1 = pad;
-    const rawY1 = pad;
-    const rawX2 = pad + actor.width  + dw;
-    const rawY2 = pad + actor.height + dh;
-
-    // Account for padding inset (same as RoundedCornersEffect)
-    const bx1 = rawX1 + cfg.padding.left   * sc;
-    const by1 = rawY1 + cfg.padding.top    * sc;
-    const bx2 = rawX2 - cfg.padding.right  * sc;
-    const by2 = rawY2 - cfg.padding.bottom * sc;
-
-    const maxR = Math.min(bx2 - bx1, by2 - by1) / 2;
-    if (maxR > 0 && radius > maxR) {
-        exponent *= maxR / radius;
-        radius    = maxR;
-    }
+    // Window content rect within the shadow actor: the frame maps to
+    // [pad, pad], inset by the padding (same basis as squircleRadius).
+    const bx1 = pad + cfg.padding.left   * sc;
+    const by1 = pad + cfg.padding.top    * sc;
+    const bx2 = pad + frame.width  - cfg.padding.right  * sc;
+    const by2 = pad + frame.height - cfg.padding.bottom * sc;
 
     // Pass sw/sh explicitly so the shader step uniform is correct even when
-    // the shadow actor's BindConstraints haven't been resolved yet.
+    // the shadow actor's allocation hasn't been resolved yet.
     effect.setClip([bx1, by1, bx2, by2], radius, exponent, sw, sh);
 }
 
@@ -572,52 +755,99 @@ function refreshShadowClip(actor, shadowActor) {
 // Effect application / removal
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Attach the RoundedCornersEffect and a custom shadow to a window actor. */
+/** Get or create the ActorData entry for a window actor. */
+function ensureActorData(actor) {
+    let data = _actorMap.get(actor);
+    if (!data) {
+        data = {
+            shadow: null,
+            connections: [],
+            signalsAttached: false,
+            laterId: 0,
+            lastScale: 0,
+            lastShadowRect: null,
+            lastShadowStyle: null,
+            lastInnerStyle: null,
+        };
+        _actorMap.set(actor, data);
+    }
+    return data;
+}
+
+/** Attach the RoundedCornersEffect (the shadow is created by the refresh). */
 function onAddEffect(actor) {
-    logDbg(`Adding effect to "${actor.metaWindow.title}"`);
+    logDbg(`Adding effect to "${actor.metaWindow?.title}"`);
 
     const win = actor.metaWindow;
+    if (!win) return;
+
     if (shouldSkip(win)) {
         logDbg(`  → skipped`);
+        // Track the window anyway: with signals attached, a later geometry
+        // change (e.g. the window opened maximized and gets unmaximized)
+        // re-evaluates shouldSkip() and adds the effect then.
+        ensureActorData(actor);
+        attachWindowSignals(actor);
+        return;
+    }
+
+    // Never attach while the texture hasn't arrived: findTextureActor()
+    // would fall back to the outer WindowActor, and once the real texture
+    // actor appears the effect would have to be added again there, orphaning
+    // the first copy (and its uniforms) on the WindowActor.  Track the
+    // window instead - the texture's arrival changes the actor size, so the
+    // per-window signals retry via queueRefresh (same deferral idea as
+    // applyEffectTo).
+    if (!getWindowTexture(actor)) {
+        ensureActorData(actor);
+        attachWindowSignals(actor);
         return;
     }
 
     const target = targetActor(actor);
     if (!target) return;
 
-    if (_actorMap.has(actor) || target.get_effect(ROUNDED_CORNERS_EFFECT)) {
+    if (_settings && getB('debug-mode')) {
+        const buf   = win.get_buffer_rect();
+        const frame = win.get_frame_rect();
+        logDbg(`  geometry: buffer=${buf.x},${buf.y} ${buf.width}x${buf.height}` +
+            ` frame=${frame.x},${frame.y} ${frame.width}x${frame.height}` +
+            ` actor=${actor.x},${actor.y} ${actor.width}x${actor.height}` +
+            ` target=${target.x},${target.y} ${target.width}x${target.height}`);
+    }
+
+    if (target.get_effect(ROUNDED_CORNERS_EFFECT)) {
         refreshRoundedCorners(actor);
         return;
     }
 
     target.add_effect_with_name(ROUNDED_CORNERS_EFFECT, new RoundedCornersEffect());
 
-    let shadow = null;
-    let bindings = [];
+    // Reuse the entry on re-add after a soft removal (unmaximize etc.) so
+    // the still-connected per-window signals are preserved.  The shadow is
+    // created (or reused) by refreshRoundedCorners' reconcile step.
+    const data = ensureActorData(actor);
+    resetShadowCaches(data);
 
-    if (getB('custom-shadow')) {
-        shadow = createShadow(actor);
-
-        // Mirror visibility / transform from window to shadow
-        for (const prop of ['pivot-point', 'translation-x', 'translation-y',
-                             'scale-x', 'scale-y', 'visible']) {
-            bindings.push(actor.bind_property(prop, shadow, prop,
-                GObject.BindingFlags.SYNC_CREATE));
-        }
-    }
-
-    _actorMap.set(actor, {
-        shadow,
-        bindings,
-        connections: [],
-        signalsAttached: false,
-        timeoutId: 0,
-    });
+    // Attach signals here (idempotent) so windows added later via
+    // refreshAll() - e.g. removed from the blacklist - also get their
+    // per-window triggers, not only those that went through applyEffectTo().
+    attachWindowSignals(actor);
     refreshRoundedCorners(actor);
 }
 
-/** Remove effects and shadow from a window actor. */
-function onRemoveEffect(actor) {
+/**
+ * Remove effects and shadow from a window actor.
+ *
+ * keepSignals=true is the "skip removal" (window became maximized /
+ * fullscreen / blacklisted): the per-window signal connections and the
+ * ActorData entry stay alive so a later geometry change (unmaximize,
+ * fullscreen exit) can re-add the effect.  Without this, maximizing a
+ * window once would disconnect everything and it would never get rounded
+ * corners back.  Hard removal (window destroyed, extension disabled)
+ * tears everything down.
+ */
+function onRemoveEffect(actor, keepSignals = false) {
     try {
         logDbg(`Removing effect from "${actor.metaWindow?.title}"`);
     } catch (_) {}
@@ -633,35 +863,25 @@ function onRemoveEffect(actor) {
     const data = _actorMap.get(actor);
     if (!data) return;
 
-    // Disconnect per-window signals safely
-    if (data.connections) {
+    // Disconnect per-window signals (hard removal only)
+    if (!keepSignals && data.connections) {
         for (const c of data.connections) {
             try { c.obj.disconnect(c.id); } catch (_) {}
         }
         data.connections = [];
     }
 
-    // Unbind property mirrors
-    for (const b of data.bindings)
-        b.unbind();
+    destroyShadow(data);
 
-    // Remove and destroy the custom shadow actor
-    if (data.shadow) {
-        try {
-            data.shadow.get_constraints().forEach(c => data.shadow.remove_constraint(c));
-            if (data.shadow.get_parent())
-                global.windowGroup.remove_child(data.shadow);
-            data.shadow.clear_effects();
-            data.shadow.destroy();
-        } catch (_) {
-            // Shadow actor may already be destroyed
-        }
+    if (data.laterId) {
+        global.compositor.get_laters().remove(data.laterId);
+        data.laterId = 0;
     }
 
-    if (data.timeoutId)
-        GLib.source_remove(data.timeoutId);
-
-    _actorMap.delete(actor);
+    if (keepSignals)
+        resetShadowCaches(data);
+    else
+        _actorMap.delete(actor);
 }
 
 /** Recompute and push all shader uniforms for a single window. */
@@ -672,43 +892,52 @@ function refreshRoundedCorners(actor) {
     const data = _actorMap.get(actor);
     const fx   = getEffect(actor);
 
-    // If neither the effect nor actor data exists, add the effect.
-    // Guard against re-entry: only call onAddEffect when there is no _actorMap
-    // entry yet (avoids the infinite loop onAddEffect → refreshRoundedCorners
-    // → onAddEffect …). onAddEffect calls refreshRoundedCorners itself at the
-    // end, so we just return here.
-    if (!fx && !data) {
+    // One config read per pass: shouldSkip, uniforms, style and clip all
+    // consume it (this runs once per frame during interactive resizes).
+    const cfg = buildConfig();
+
+    if (shouldSkip(win, cfg)) {
+        // Soft removal: keep signals + ActorData so unmaximize / fullscreen
+        // exit / list changes can bring the effect back via the next trigger.
+        if (data) onRemoveEffect(actor, true);
+        return;
+    }
+
+    // Not skipped but no effect attached: either a fresh window or one that
+    // was soft-removed.  onAddEffect() (re)creates the effect and ends by
+    // calling refreshRoundedCorners() again with fx present, so there is no
+    // recursion.
+    if (!fx) {
         onAddEffect(actor);
         return;
     }
+    // Restore the effect unless the minimize handler disabled it - the
+    // unminimize paths own re-enabling in that case (a settings change while
+    // minimized must not reactivate the shader mid-lamp).
+    if (!fx.enabled && !win.minimized)
+        fx.enabled = true;
 
-    if (shouldSkip(win)) {
-        if (data) onRemoveEffect(actor);
-        return;
-    }
+    const geom = shadowGeometry(win);
+    fx.updateUniforms(geom.sc, cfg, computeBounds(actor));
 
-    if (!fx) return;   // effect was removed due to shouldSkip during onAddEffect
-    if (!fx.enabled) fx.enabled = true;
-
-    const cfg = buildConfig();
-    fx.updateUniforms(scaleFactor(win), cfg, computeBounds(actor));
-
-    // Update shadow
     if (data) {
-        refreshShadowStyle(actor, data.shadow);
-        refreshShadowClip(actor, data.shadow);
+        data.lastScale = geom.sc;
 
-        // Keep BindConstraint offsets in sync with the current window geometry
-        const sc  = scaleFactor(win);
-        const pad = SHADOW_PADDING * sc;
-        const [dx, dy, dw, dh] = contentOffset(win);
-        const newOffsets = [dx - pad, dy - pad, dw + 2 * pad, dh + 2 * pad];
+        // Reconcile with the custom-shadow setting (toggleable at runtime)
+        const wantShadow = getB('custom-shadow');
+        if (wantShadow && !data.shadow) {
+            data.shadow = createShadow(actor);
+            syncShadowVisibility(actor);
+        } else if (!wantShadow && data.shadow) {
+            destroyShadow(data);
+        }
 
+        // One shared geometry so pad/frame can never diverge between the
+        // clip's [pad, pad] origin and the shadow actor's position.
         if (data.shadow) {
-            data.shadow.get_constraints().forEach((c, i) => {
-                if (c instanceof Clutter.BindConstraint)
-                    c.offset = newOffsets[i];
-            });
+            refreshShadowStyle(actor, data.shadow, geom, cfg);
+            refreshShadowClip(actor, data.shadow, geom, cfg);
+            positionShadow(actor, data.shadow, geom);
         }
     }
 }
@@ -748,16 +977,30 @@ function removeConnections(obj) {
     while (i--) {
         const c = _connections[i];
         if (!obj || c.object === obj) {
-            c.object.disconnect(c.id);
+            try { c.object.disconnect(c.id); } catch (_) {}
             _connections.splice(i, 1);
         }
     }
 }
 
 function disconnectAll() {
-    for (const c of _connections)
-        c.object.disconnect(c.id);
+    for (const c of _connections) {
+        try { c.object.disconnect(c.id); } catch (_) {}
+    }
     _connections = [];
+}
+
+/**
+ * One-shot deferred connection, tracked in the global connection list so
+ * disable() tears it down if it never fires.  The object must not carry any
+ * other tracked global connection (true for the deferral targets: a fresh
+ * WindowActor or Meta.Window that has not been wired up yet).
+ */
+function connectOnce(obj, signal, cb) {
+    addConnection(obj, signal, (...args) => {
+        removeConnections(obj);
+        cb(...args);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -778,17 +1021,59 @@ function attachWindowSignals(actor) {
     const win     = actor.metaWindow;
     const texture = getWindowTexture(actor);
 
-    // Window resized → update shader uniforms
-    addWinConn(actor,   'notify::size',  () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+    // Geometry triggers all funnel through queueRefresh(): one geometry
+    // change fires several of these in the same frame (actor notify::size,
+    // texture size-changed, win size-changed for frame-only changes such as
+    // Chromium/Electron CSD margin updates), and the coalesced BEFORE_REDRAW
+    // refresh runs once with position, clip and style updated atomically.
+    const queue = () => { if (actor.metaWindow) queueRefresh(actor); };
+    addWinConn(actor, 'notify::size', queue);
     if (texture)
-        addWinConn(texture, 'size-changed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+        addWinConn(texture, 'size-changed', queue);
+    addWinConn(win, 'size-changed', queue);
+
+    // Fires every frame during a drag: cheap path (move the shadow only -
+    // the clip depends on frame size, not position).  If the window crossed
+    // to a monitor with a different scale, pad/clip/style are all stale →
+    // full refresh.
+    addWinConn(win, 'position-changed', () => {
+        if (!actor.metaWindow) return;
+        const data = _actorMap.get(actor);
+        if (!data) return;
+        if (data.lastScale && scaleFactor(actor.metaWindow) !== data.lastScale)
+            queueRefresh(actor);
+        else
+            positionShadow(actor, data.shadow);
+    });
 
     // Fullscreen state changed (may not cause a size change)
-    addWinConn(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
-    // Focus changed → update shadow style
+    addWinConn(win, 'notify::fullscreen', queue);
+    // Focus changed → update shadow style (style caching makes this cheap)
     addWinConn(win, 'notify::appears-focused',() => { if (actor.metaWindow) refreshFocus(actor); });
-    // Monitor / workspace change
-    addWinConn(win, 'workspace-changed',      () => { if (actor.metaWindow) refreshFocus(actor); });
+    // Monitor / workspace change → scale may have changed, full refresh
+    addWinConn(win, 'workspace-changed', queue);
+
+    // Transform / visibility watcher: hide the shadow while the actor is
+    // animated (minimize, unminimize, maximize size-change, extension
+    // effects) and reveal it - repositioned - the moment it is at rest.
+    // These fire per animation frame; syncShadowVisibility early-outs when
+    // the state is unchanged, so the steady cost is a few property reads.
+    const sync = () => { if (actor.metaWindow) syncShadowVisibility(actor); };
+    for (const prop of ['scale-x', 'scale-y',
+                        'translation-x', 'translation-y', 'visible'])
+        addWinConn(actor, `notify::${prop}`, sync);
+
+    // Mirror opacity so fade animations (opacity-only map/close effects)
+    // don't show a full-strength shadow around a translucent window.
+    // Opacity mirroring is safe - unlike scale/translation it cannot desync
+    // shadow and window geometry.
+    addWinConn(actor, 'notify::opacity', () => {
+        const d = _actorMap.get(actor);
+        // Only when shown and actually changed: a hidden shadow needs no
+        // redraw, and syncShadowVisibility re-syncs opacity on reveal.
+        if (d?.shadow?.visible && d.shadow.opacity !== actor.opacity)
+            d.shadow.opacity = actor.opacity;
+    });
 
     if (data)
         data.signalsAttached = true;
@@ -806,10 +1091,7 @@ function applyEffectTo(actor) {
 
     // Wayland / XWayland windows may not have a surface child yet.
     if (!actor.get_first_child?.()) {
-        const connId = actor.connect('notify::first-child', () => {
-            actor.disconnect(connId);
-            applyEffectTo(actor);
-        });
+        connectOnce(actor, 'notify::first-child', () => applyEffectTo(actor));
         return;
     }
 
@@ -818,12 +1100,7 @@ function applyEffectTo(actor) {
         // OpenGL-accelerated X11 apps (VirtualBox, Qt-GL, some Chromium builds)
         // where the window is mapped before its first paint arrives.
         // Wait for the actor's size to change (first paint / resize), then retry.
-        // We disconnect before retrying to avoid double-applying the effect.
-        let connId;
-        connId = actor.connect('notify::size', () => {
-            actor.disconnect(connId);
-            applyEffectTo(actor);
-        });
+        connectOnce(actor, 'notify::size', () => applyEffectTo(actor));
         return;
     }
 
@@ -845,18 +1122,24 @@ function applyEffectToWindow(win) {
         return;
     }
 
-    let connId;
-    connId = win.connect('notify::compositor-private', () => {
+    // Tracked like the actor deferrals so disable() cleans it up; keeps
+    // waiting if the property notifies with a null value.
+    addConnection(win, 'notify::compositor-private', () => {
         const nextActor = win.get_compositor_private?.();
         if (!nextActor)
             return;
 
-        win.disconnect(connId);
+        removeConnections(win);
         applyEffectTo(nextActor);
     });
 }
 
 function removeEffectFrom(actor) {
+    // Clear any pending one-shot deferrals for this window so they don't
+    // fire after the window is gone.
+    removeConnections(actor);
+    if (actor.metaWindow)
+        removeConnections(actor.metaWindow);
     onRemoveEffect(actor);
 }
 
@@ -879,8 +1162,9 @@ function enableEffect() {
     addConnection(global.windowManager, 'destroy',
         (_, actor) => removeEffectFrom(actor));
 
-    // Minimise: always hide shadow + disable effect to prevent the white
-    // background of the shadow actor from showing during the animation.
+    // Minimise: hide the shadow up front (covers magic-lamp minimize, which
+    // deforms the actor without touching scale/translation, so the transform
+    // watcher cannot see it) and disable the corner effect for the animation.
     addConnection(global.windowManager, 'minimize',
         (_, actor) => {
             const data = _actorMap.get(actor);
@@ -890,8 +1174,12 @@ function enableEffect() {
             if (fx) fx.enabled = false;
         });
 
-    // Unminimise: restore shadow + effect.  For the Magic-Lamp extension,
-    // wait until the animation is nearly finished before showing the shadow.
+    // Unminimise: restore the corner effect.  The shadow is NOT shown here -
+    // the transform watcher (syncShadowVisibility) reveals it in the same
+    // frame the unminimize animation lands, avoiding the drift artifact of a
+    // shadow visible mid-animation.  For the Magic-Lamp extension the actor
+    // is deformed with scale/translation untouched, so wait until the lamp
+    // animation is nearly finished before showing the shadow.
     addConnection(global.windowManager, 'unminimize',
         (_, actor) => {
             const data = _actorMap.get(actor);
@@ -902,25 +1190,42 @@ function enableEffect() {
                 data.shadow.visible = false;
                 const timer = lamp.timerId;
                 if (timer) {
-                    const tid = timer.connect('new-frame', src => {
-                        if (src.get_progress() > 0.98) {
-                            data.shadow.visible = true;
-                            fx.enabled = true;
-                            src.disconnect(tid);
-                        }
+                    // Track the connection in data.connections so a destroy
+                    // or extension disable mid-lamp disconnects it (clean
+                    // teardown); re-check the window state when it fires -
+                    // the shadow/effect may be gone by then.
+                    const conn = { obj: timer, id: 0 };
+                    conn.id = timer.connect('new-frame', src => {
+                        if (src.get_progress() <= 0.98)
+                            return;
+                        src.disconnect(conn.id);
+                        const idx = data.connections.indexOf(conn);
+                        if (idx !== -1)
+                            data.connections.splice(idx, 1);
+
+                        const d = _actorMap.get(actor);
+                        if (d?.shadow)
+                            d.shadow.visible = true;
+                        const effect = getEffect(actor);
+                        if (effect)
+                            effect.enabled = true;
                     });
+                    data.connections.push(conn);
                 }
                 return;
             }
 
-            // Standard unminimise (no magic lamp)
-            if (data?.shadow)
-                data.shadow.visible = true;
+            // Standard unminimise: the watcher shows the shadow at rest
             if (fx) fx.enabled = true;
         });
 
     // Window re-stack → reorder shadow actors
     addConnection(global.display, 'restacked', onRestacked);
+
+    // Monitor layout / scale changed → every scale-dependent value (pad,
+    // clip, style, shader uniforms) may be stale, and a scale change alone
+    // fires none of the per-window geometry signals.
+    addConnection(Main.layoutManager, 'monitors-changed', () => refreshAll());
 
     // Settings changed → reapply all with debounce to prevent slider lag
     addConnection(_settings, 'changed', () => {
@@ -930,6 +1235,7 @@ function enableEffect() {
         }
         _settingsTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             _appTypeCache.clear();
+            _blacklistCache = null;
             refreshAll();
             _settingsTimeoutId = 0;
             return GLib.SOURCE_REMOVE;
@@ -941,13 +1247,14 @@ function disableEffect() {
     for (const actor of global.get_window_actors())
         removeEffectFrom(actor);
     disconnectAll();
-    
+
     if (_settingsTimeoutId) {
         GLib.source_remove(_settingsTimeoutId);
         _settingsTimeoutId = 0;
     }
-    
+
     _appTypeCache.clear();
+    _blacklistCache = null;
     if (_mutterSettings && _mutterSettingsConn) {
         _mutterSettings.disconnect(_mutterSettingsConn);
         _mutterSettingsConn = 0;
