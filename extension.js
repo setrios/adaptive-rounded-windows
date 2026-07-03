@@ -78,6 +78,7 @@ let _mutterSettings = null;
 let _mutterSettingsConn = 0;
 let _fractionalScaling = null;
 let _settingsTimeoutId = 0;
+let _darkMode = false;   // system style prefers dark (St.Settings color-scheme)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings helpers
@@ -89,6 +90,11 @@ function getD(key)   { return _settings.get_double(key); }
 
 /** Build the per-window config object from GSettings. */
 function buildConfig() {
+    // Theme-aware border: border-* is the light-theme (and only) colour;
+    // dark-border-* applies while the system style prefers dark.
+    const border = (_darkMode && getB('theme-aware-border'))
+        ? 'dark-border' : 'border';
+
     return {
         cornerRadius: getI('corner-radius'),
         smoothing:    getD('smoothing'),
@@ -100,10 +106,10 @@ function buildConfig() {
         },
         borderWidth: getI('border-width'),
         borderColor: [
-            getD('border-red'),
-            getD('border-green'),
-            getD('border-blue'),
-            getD('border-alpha'),
+            getD(`${border}-red`),
+            getD(`${border}-green`),
+            getD(`${border}-blue`),
+            getD(`${border}-alpha`),
         ],
         keepRoundedMaximized:  getB('keep-rounded-maximized'),
         keepRoundedFullscreen: getB('keep-rounded-fullscreen'),
@@ -1227,6 +1233,18 @@ function enableEffect() {
     // fires none of the per-window geometry signals.
     addConnection(Main.layoutManager, 'monitors-changed', () => refreshAll());
 
+    // System light/dark style changed → theme-aware border colour may differ
+    const stSettings = St.Settings.get();
+    const updateDarkMode = () => {
+        _darkMode =
+            stSettings.color_scheme === St.SystemColorScheme.PREFER_DARK;
+    };
+    updateDarkMode();
+    addConnection(stSettings, 'notify::color-scheme', () => {
+        updateDarkMode();
+        refreshAll();
+    });
+
     // Settings changed → reapply all with debounce to prevent slider lag
     addConnection(_settings, 'changed', () => {
         if (_settingsTimeoutId) {
@@ -1255,6 +1273,7 @@ function disableEffect() {
 
     _appTypeCache.clear();
     _blacklistCache = null;
+    _darkMode = false;
     if (_mutterSettings && _mutterSettingsConn) {
         _mutterSettings.disconnect(_mutterSettingsConn);
         _mutterSettingsConn = 0;

@@ -77,6 +77,29 @@
       <default>1.0</default>
     </key>
 
+    <!-- Theme-aware border: when enabled, border-* is the light-theme colour
+         and dark-border-* is used while the system style prefers dark -->
+    <key name="theme-aware-border" type="b">
+      <default>false</default>
+      <summary>Use different border colours for light and dark themes</summary>
+    </key>
+    <key name="dark-border-red" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.8</default>
+    </key>
+    <key name="dark-border-green" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.8</default>
+    </key>
+    <key name="dark-border-blue" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.85</default>
+    </key>
+    <key name="dark-border-alpha" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>1.0</default>
+    </key>
+
     <!-- ── Behaviour ───────────────────────────────────────────────────── -->
     <key name="keep-rounded-maximized" type="b">
       <default>false</default>

@@ -7,6 +7,7 @@
 
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
@@ -60,6 +61,41 @@ function makeSpinRow(title, subtitle, min, max, step, digits = 0) {
     row.add_suffix(spin);
     row.activatable_widget = spin;
     return { row, adj, spin };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Colour-row builder (Adw.ActionRow + Gtk.ColorButton bound bidirectionally
+// to the four `${keyPrefix}-red/green/blue/alpha` double keys)
+// ─────────────────────────────────────────────────────────────────────────────
+function makeColorRow(settings, title, subtitle, keyPrefix) {
+    const row = new Adw.ActionRow({ title, subtitle });
+    const btn = new Gtk.ColorButton({
+        use_alpha: true,
+        valign:    Gtk.Align.CENTER,
+    });
+
+    const updateBtn = () => {
+        const rgba = new Gdk.RGBA();
+        rgba.red   = settings.get_double(`${keyPrefix}-red`);
+        rgba.green = settings.get_double(`${keyPrefix}-green`);
+        rgba.blue  = settings.get_double(`${keyPrefix}-blue`);
+        rgba.alpha = settings.get_double(`${keyPrefix}-alpha`);
+        btn.set_rgba(rgba);
+    };
+    updateBtn();
+
+    btn.connect('color-set', () => {
+        const c = btn.get_rgba();
+        settings.set_double(`${keyPrefix}-red`,   c.red);
+        settings.set_double(`${keyPrefix}-green`, c.green);
+        settings.set_double(`${keyPrefix}-blue`,  c.blue);
+        settings.set_double(`${keyPrefix}-alpha`, c.alpha);
+    });
+    for (const ch of ['red', 'green', 'blue', 'alpha'])
+        settings.connect(`changed::${keyPrefix}-${ch}`, updateBtn);
+
+    row.add_suffix(btn);
+    return row;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,33 +191,25 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
         bindAdjInt(settings, 'border-width', bwRow.adj);
         borderGroup.add(bwRow.row);
 
-        // Border colour (RGBA via Gtk.ColorButton)
-        const colorRow = new Adw.ActionRow({ title: _('Colour') });
-        const colorBtn  = new Gtk.ColorButton({
-            use_alpha: true,
-            valign:    Gtk.Align.CENTER,
+        // Border colour (RGBA via Gtk.ColorButton); doubles as the
+        // light-theme colour when theme-aware colours are enabled
+        borderGroup.add(makeColorRow(settings, _('Colour'),
+            _('Used in the light theme when theme-aware colours are on'),
+            'border'));
+
+        // Theme-aware border colours
+        const themeRow = new Adw.SwitchRow({
+            title:    _('Different colours for light and dark theme'),
+            subtitle: _('Follows the system Appearance style'),
         });
-        // Read initial colour from settings
-        const updateColorBtn = () => {
-            const rgba    = new Gdk.RGBA();
-            rgba.red   = settings.get_double('border-red');
-            rgba.green = settings.get_double('border-green');
-            rgba.blue  = settings.get_double('border-blue');
-            rgba.alpha = settings.get_double('border-alpha');
-            colorBtn.set_rgba(rgba);
-        };
-        updateColorBtn();
-        colorBtn.connect('color-set', () => {
-            const c = colorBtn.get_rgba();
-            settings.set_double('border-red',   c.red);
-            settings.set_double('border-green', c.green);
-            settings.set_double('border-blue',  c.blue);
-            settings.set_double('border-alpha', c.alpha);
-        });
-        for (const k of ['border-red', 'border-green', 'border-blue', 'border-alpha'])
-            settings.connect(`changed::${k}`, updateColorBtn);
-        colorRow.add_suffix(colorBtn);
-        borderGroup.add(colorRow);
+        bindBool(settings, 'theme-aware-border', themeRow);
+        borderGroup.add(themeRow);
+
+        const darkColorRow = makeColorRow(settings,
+            _('Colour (dark theme)'), '', 'dark-border');
+        settings.bind('theme-aware-border', darkColorRow, 'sensitive',
+            Gio.SettingsBindFlags.GET);
+        borderGroup.add(darkColorRow);
 
         // ── Group: Behaviour ─────────────────────────────────────────────────
         const behGroup = new Adw.PreferencesGroup({ title: _('Behaviour') });
