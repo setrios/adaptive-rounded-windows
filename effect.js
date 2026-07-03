@@ -256,7 +256,7 @@ export const RoundedCornersEffect = GObject.registerClass(
 // ClipShadowEffect
 //
 // Clips the custom CSS shadow so it is transparent exactly where the window
-// content is — following the squircle shape instead of a plain rectangle.
+// content is - following the squircle shape instead of a plain rectangle.
 // ─────────────────────────────────────────────────────────────────────────────
 export const ClipShadowEffect = GObject.registerClass(
     { GTypeName: 'RWCClipShadowEffect' },

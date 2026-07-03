@@ -28,7 +28,7 @@
  * change can re-add the effect (unmaximize, fullscreen exit).
  *
  * Shadow visibility is owned by syncShadowVisibility(): hidden whenever the
- * WindowActor is transformed (animations), shown — repositioned — in the
+ * WindowActor is transformed (animations), shown - repositioned - in the
  * same frame the actor returns to identity.  The actor's transforms are
  * deliberately NOT mirrored onto the shadow (see shadowShouldBeVisible).
  *
@@ -396,7 +396,7 @@ function computeBounds(actor) {
     const target = targetActor(actor) ?? actor;
     const targetW = target.width;
     const targetH = target.height;
-    
+
     const [dx, dy, dw, dh] = contentOffset(win);
     // The frame area starts at (dx, dy) inside the buffer actor, because dx/dy
     // is the difference between the visible frame and the underlying buffer.
@@ -445,7 +445,7 @@ function shadowGeometry(win) {
  * clamp, for a window whose content area is (frameW − padding) × (frameH −
  * padding).  Shared by refreshShadowClip() (the shader clip) and
  * refreshShadowStyle() (the CSS border-radius) so the shadow's transparent
- * corners always trace exactly the clipped contour — the coupling CLAUDE.md
+ * corners always trace exactly the clipped contour - the coupling CLAUDE.md
  * requires.  RoundedCornersEffect.updateUniforms() keeps its own copy because
  * it derives bounds from the target-actor allocation, not the frame rect.
  */
@@ -528,7 +528,7 @@ function positionShadow(actor, shadow, geom = null) {
  * The shadow is only correct when the window actor is at rest.  During
  * animated transitions (minimize/unminimize, maximize size-change, …) the
  * shell eases the actor's position/scale/translation; the shadow is anchored
- * to the static frame rect and cannot follow those transforms — mirroring
+ * to the static frame rect and cannot follow those transforms - mirroring
  * them via property bindings is geometrically wrong because shadow and actor
  * have different sizes and origins (that mirroring caused the "shadow drifts
  * in from the top-left" artifact).  So: hidden while transformed, shown at
@@ -553,7 +553,7 @@ function shadowShouldBeVisible(actor) {
  * Single authority for shadow visibility, driven by the actor's
  * transform/visibility notify signals.  The reveal happens synchronously in
  * the same tick the animation lands on identity, before that frame is
- * painted — the shadow pops in together with the window's resting frame.
+ * painted - the shadow pops in together with the window's resting frame.
  *
  * Exceptions that may force-hide outside this function: the 'minimize'
  * handler (magic-lamp minimize deforms the actor without touching
@@ -569,7 +569,7 @@ function syncShadowVisibility(actor) {
 
     if (show) {
         // The monitor scale may have changed while hidden (e.g. revealed on
-        // a different-scale monitor): queue a full refresh — it runs before
+        // a different-scale monitor): queue a full refresh - it runs before
         // this frame paints, so clip and style land coherent with the scale.
         const win = actor.metaWindow;
         if (win && data.lastScale && data.lastScale !== scaleFactor(win))
@@ -676,7 +676,7 @@ function refreshShadowStyle(actor, shadowActor, geom = null, cfg = null) {
 
     const shadowStyle = `padding: ${pad}px;`;
 
-    // Use transparent background — NEVER white.  The box-shadow alone provides
+    // Use transparent background - NEVER white.  The box-shadow alone provides
     // the visual shadow.  A white background would bleed through the shader's
     // transparent squircle corners because CSS border-radius is circular.
     const innerStyle = hide
@@ -689,8 +689,8 @@ function refreshShadowStyle(actor, shadowActor, geom = null, cfg = null) {
                    ${cfg.padding.bottom * cssScale}px
                    ${cfg.padding.left   * cssScale}px;`;
 
-    // The style strings only depend on config/focus/maximize/scale — not on
-    // the frame geometry — so during resizes and drags they are identical
+    // The style strings only depend on config/focus/maximize/scale - not on
+    // the frame geometry - so during resizes and drags they are identical
     // every frame.  Skip the assignment then: setting inline style forces a
     // CSS re-parse and relayout even when the string is unchanged.
     const data = _actorMap.get(actor);
@@ -729,7 +729,7 @@ function refreshShadowClip(actor, shadowActor, geom = null, cfg = null) {
     cfg = cfg ?? buildConfig();
 
     // A momentarily 0-sized frame (window mapped before its first allocation)
-    // would produce inverted clip bounds — skip until real geometry arrives.
+    // would produce inverted clip bounds - skip until real geometry arrives.
     if (frame.width <= 0 || frame.height <= 0) return;
 
     const sw = frame.width  + 2 * pad;
@@ -795,7 +795,7 @@ function onAddEffect(actor) {
     // would fall back to the outer WindowActor, and once the real texture
     // actor appears the effect would have to be added again there, orphaning
     // the first copy (and its uniforms) on the WindowActor.  Track the
-    // window instead — the texture's arrival changes the actor size, so the
+    // window instead - the texture's arrival changes the actor size, so the
     // per-window signals retry via queueRefresh (same deferral idea as
     // applyEffectTo).
     if (!getWindowTexture(actor)) {
@@ -830,7 +830,7 @@ function onAddEffect(actor) {
     resetShadowCaches(data);
 
     // Attach signals here (idempotent) so windows added later via
-    // refreshAll() — e.g. removed from the blacklist — also get their
+    // refreshAll() - e.g. removed from the blacklist - also get their
     // per-window triggers, not only those that went through applyEffectTo().
     attachWindowSignals(actor);
     refreshRoundedCorners(actor);
@@ -911,7 +911,7 @@ function refreshRoundedCorners(actor) {
         onAddEffect(actor);
         return;
     }
-    // Restore the effect unless the minimize handler disabled it — the
+    // Restore the effect unless the minimize handler disabled it - the
     // unminimize paths own re-enabling in that case (a settings change while
     // minimized must not reactivate the shader mid-lamp).
     if (!fx.enabled && !win.minimized)
@@ -1032,7 +1032,7 @@ function attachWindowSignals(actor) {
         addWinConn(texture, 'size-changed', queue);
     addWinConn(win, 'size-changed', queue);
 
-    // Fires every frame during a drag: cheap path (move the shadow only —
+    // Fires every frame during a drag: cheap path (move the shadow only -
     // the clip depends on frame size, not position).  If the window crossed
     // to a monitor with a different scale, pad/clip/style are all stale →
     // full refresh.
@@ -1055,7 +1055,7 @@ function attachWindowSignals(actor) {
 
     // Transform / visibility watcher: hide the shadow while the actor is
     // animated (minimize, unminimize, maximize size-change, extension
-    // effects) and reveal it — repositioned — the moment it is at rest.
+    // effects) and reveal it - repositioned - the moment it is at rest.
     // These fire per animation frame; syncShadowVisibility early-outs when
     // the state is unchanged, so the steady cost is a few property reads.
     const sync = () => { if (actor.metaWindow) syncShadowVisibility(actor); };
@@ -1065,7 +1065,7 @@ function attachWindowSignals(actor) {
 
     // Mirror opacity so fade animations (opacity-only map/close effects)
     // don't show a full-strength shadow around a translucent window.
-    // Opacity mirroring is safe — unlike scale/translation it cannot desync
+    // Opacity mirroring is safe - unlike scale/translation it cannot desync
     // shadow and window geometry.
     addWinConn(actor, 'notify::opacity', () => {
         const d = _actorMap.get(actor);
@@ -1174,7 +1174,7 @@ function enableEffect() {
             if (fx) fx.enabled = false;
         });
 
-    // Unminimise: restore the corner effect.  The shadow is NOT shown here —
+    // Unminimise: restore the corner effect.  The shadow is NOT shown here -
     // the transform watcher (syncShadowVisibility) reveals it in the same
     // frame the unminimize animation lands, avoiding the drift artifact of a
     // shadow visible mid-animation.  For the Magic-Lamp extension the actor
@@ -1192,7 +1192,7 @@ function enableEffect() {
                 if (timer) {
                     // Track the connection in data.connections so a destroy
                     // or extension disable mid-lamp disconnects it (clean
-                    // teardown); re-check the window state when it fires —
+                    // teardown); re-check the window state when it fires -
                     // the shadow/effect may be gone by then.
                     const conn = { obj: timer, id: 0 };
                     conn.id = timer.connect('new-frame', src => {
@@ -1247,12 +1247,12 @@ function disableEffect() {
     for (const actor of global.get_window_actors())
         removeEffectFrom(actor);
     disconnectAll();
-    
+
     if (_settingsTimeoutId) {
         GLib.source_remove(_settingsTimeoutId);
         _settingsTimeoutId = 0;
     }
-    
+
     _appTypeCache.clear();
     _blacklistCache = null;
     if (_mutterSettings && _mutterSettingsConn) {
