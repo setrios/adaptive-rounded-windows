@@ -159,7 +159,9 @@ Then restart GNOME Shell (step 4 above).
 | Smoothing | `0` = circle · `1` = squircle (superellipse) | `0.6` |
 | Clip padding | Extra gap between the window edge and the clip boundary | `1` |
 | Border width | Positive = inner border · Negative = outer · `0` = none | `0` |
-| Border colour | RGBA colour picker | white |
+| Border colour | RGBA colour picker; doubles as the light-theme colour when theme-aware colours are on | light grey |
+| Different colours for light and dark theme | Follow the system Appearance style (only the explicit *Dark* style triggers the dark colour) | off |
+| Colour (dark theme) | RGBA colour picker used while the Appearance style is set to Dark | dark grey |
 | Keep rounded when maximised | Apply corners even when a window fills the screen | off |
 | Keep rounded when full-screen | Apply corners in full-screen mode | off |
 

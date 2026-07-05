@@ -85,15 +85,15 @@
     </key>
     <key name="dark-border-red" type="d">
       <range min="0.0" max="1.0"/>
-      <default>0.8</default>
+      <default>0.2</default>
     </key>
     <key name="dark-border-green" type="d">
       <range min="0.0" max="1.0"/>
-      <default>0.8</default>
+      <default>0.2</default>
     </key>
     <key name="dark-border-blue" type="d">
       <range min="0.0" max="1.0"/>
-      <default>0.85</default>
+      <default>0.25</default>
     </key>
     <key name="dark-border-alpha" type="d">
       <range min="0.0" max="1.0"/>

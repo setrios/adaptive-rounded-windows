@@ -91,8 +91,15 @@ function makeColorRow(settings, title, subtitle, keyPrefix) {
         settings.set_double(`${keyPrefix}-blue`,  c.blue);
         settings.set_double(`${keyPrefix}-alpha`, c.alpha);
     });
-    for (const ch of ['red', 'green', 'blue', 'alpha'])
-        settings.connect(`changed::${keyPrefix}-${ch}`, updateBtn);
+    // Track the ids and disconnect on row destruction: the Gio.Settings
+    // object can outlive the window, and a changed:: emission landing after
+    // close would call set_rgba() on the disposed colour button.
+    const changedIds = ['red', 'green', 'blue', 'alpha'].map(ch =>
+        settings.connect(`changed::${keyPrefix}-${ch}`, updateBtn));
+    row.connect('destroy', () => {
+        for (const id of changedIds)
+            settings.disconnect(id);
+    });
 
     row.add_suffix(btn);
     return row;
@@ -194,7 +201,7 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
         // Border colour (RGBA via Gtk.ColorButton); doubles as the
         // light-theme colour when theme-aware colours are enabled
         borderGroup.add(makeColorRow(settings, _('Colour'),
-            _('Used in the light theme when theme-aware colours are on'),
+            _('Doubles as the light-theme colour when theme-aware colours are on'),
             'border'));
 
         // Theme-aware border colours
@@ -206,7 +213,9 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
         borderGroup.add(themeRow);
 
         const darkColorRow = makeColorRow(settings,
-            _('Colour (dark theme)'), '', 'dark-border');
+            _('Colour (dark theme)'),
+            _('Applies while the system Appearance style is set to Dark'),
+            'dark-border');
         settings.bind('theme-aware-border', darkColorRow, 'sensitive',
             Gio.SettingsBindFlags.GET);
         borderGroup.add(darkColorRow);

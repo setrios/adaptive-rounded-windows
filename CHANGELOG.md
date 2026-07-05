@@ -2,7 +2,7 @@
 
 ## v2.3.0
 
-- Add optional separate border colours for light and dark system themes (toggle in Corners → Border; follows the system Appearance style live).
+- Add optional separate border colours for light and dark system themes (toggle in Corners → Border; follows the system Appearance style live, including across screen lock/unlock).
 - Fix the custom shadow being drawn offset on Chromium/Electron windows (Wayland CSD shadow margins) - the shadow is now anchored to the window frame.
 - Fix the shadow drifting in from the top-left during minimize/unminimize/maximize animations - it now hides while the window animates and appears the moment it lands.
 - Fix windows permanently losing rounded corners after being maximized or fullscreened.

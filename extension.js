@@ -78,7 +78,6 @@ let _mutterSettings = null;
 let _mutterSettingsConn = 0;
 let _fractionalScaling = null;
 let _settingsTimeoutId = 0;
-let _darkMode = false;   // system style prefers dark (St.Settings color-scheme)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings helpers
@@ -91,8 +90,13 @@ function getD(key)   { return _settings.get_double(key); }
 /** Build the per-window config object from GSettings. */
 function buildConfig() {
     // Theme-aware border: border-* is the light-theme (and only) colour;
-    // dark-border-* applies while the system style prefers dark.
-    const border = (_darkMode && getB('theme-aware-border'))
+    // dark-border-* applies while the system Appearance style prefers dark.
+    // Read the scheme live like every other input - a cached module value
+    // here went stale across the disable/enable cycle that screen lock
+    // triggers, painting light borders on every unlock.
+    const dark = St.Settings.get().color_scheme ===
+        St.SystemColorScheme.PREFER_DARK;
+    const border = (dark && getB('theme-aware-border'))
         ? 'dark-border' : 'border';
 
     return {
@@ -1233,16 +1237,14 @@ function enableEffect() {
     // fires none of the per-window geometry signals.
     addConnection(Main.layoutManager, 'monitors-changed', () => refreshAll());
 
-    // System light/dark style changed → theme-aware border colour may differ
-    const stSettings = St.Settings.get();
-    const updateDarkMode = () => {
-        _darkMode =
-            stSettings.color_scheme === St.SystemColorScheme.PREFER_DARK;
-    };
-    updateDarkMode();
-    addConnection(stSettings, 'notify::color-scheme', () => {
-        updateDarkMode();
-        refreshAll();
+    // System light/dark style changed → repaint so buildConfig() picks the
+    // other border colour.  buildConfig() reads the scheme live, so this is
+    // purely a repaint trigger; skip it while theme-aware borders are off
+    // (the colour cannot change then, and enabling the toggle later repaints
+    // via the settings 'changed' debounce below).
+    addConnection(St.Settings.get(), 'notify::color-scheme', () => {
+        if (getB('theme-aware-border'))
+            refreshAll();
     });
 
     // Settings changed → reapply all with debounce to prevent slider lag
@@ -1273,7 +1275,6 @@ function disableEffect() {
 
     _appTypeCache.clear();
     _blacklistCache = null;
-    _darkMode = false;
     if (_mutterSettings && _mutterSettingsConn) {
         _mutterSettings.disconnect(_mutterSettingsConn);
         _mutterSettingsConn = 0;
