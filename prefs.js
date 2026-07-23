@@ -1,5 +1,5 @@
 /**
- * prefs.js – Preferences window for Rounded Window Corners
+ * prefs.js – Preferences window for Adaptive Rounded Corners
  *
  * UI is built with libadwaita (Adw) widgets on top of GTK4, following the
  * GNOME 45+ ExtensionPreferences API.
@@ -373,7 +373,7 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
         const aboutGroup = new Adw.PreferencesGroup();
         aboutPage.add(aboutGroup);
 
-        const nameRow = new Adw.ActionRow({ title: _('Rounded Window Corners') });
+        const nameRow = new Adw.ActionRow({ title: _('Adaptive Rounded Corners') });
         nameRow.add_suffix(new Gtk.Label({
             label:  this.metadata['version-name'] ?? '1.0',
             xalign: 1,

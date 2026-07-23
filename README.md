@@ -4,12 +4,12 @@
   <img src="https://img.shields.io/badge/JS-ES2022-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="JavaScript">
 </p>
 
-<h1 align="center">Rounded Window Corners</h1>
+<h1 align="center">Adaptive Rounded Corners</h1>
 
 <p align="center">
-  A GNOME Shell extension that adds <strong>rounded corners</strong> to top-level windows -<br>
+  A GNOME Shell extension that adds <strong>adaptive rounded corners</strong> to top-level windows -<br>
   including apps that don't use libadwaita or libhandy (Firefox, VS Code, Chromium, Electron apps, JetBrains IDEs, etc.).<br>
-  GPU-accelerated GLSL shader. No build step, no bundler - pure JavaScript.
+  GPU-accelerated GLSL shader with <strong>theme-aware border colours</strong>. No build step, no bundler - pure JavaScript.
 </p>
 
 ---
@@ -36,8 +36,23 @@
 
 ---
 
+## What's New in v2.3.0
+
+This fork adds several enhancements to the original extension:
+
+- **Theme-aware border colours** - separate colors for light/dark themes that follow your system appearance
+- Fixed shadow positioning on Chromium/Electron windows
+- Fixed shadow animation drift during minimize/maximize
+- Performance improvements with coalesced refreshes and cached settings
+- Better stability and teardown handling
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## Features
 
+- **Theme-aware borders** - optional separate colors for light/dark system themes that follow GNOME's Appearance style
 - **Rounded corners** - GLSL fragment shader applied per-window at draw time
 - **Squircle / superellipse** - adjustable smoothing (0 = circle, 1 = squircle)
 - **Custom shadow** - rounded CSS `box-shadow` replaces GNOME's default rectangular shadow, clipped with the same squircle curve
@@ -91,7 +106,7 @@ sudo zypper install glib2-tools
 ### 2. Clone the repository
 
 ```bash
-git clone https://github.com/Nathanaelrc/rounded-windows.git
+git clone https://github.com/setrios/rounded-windows.git
 cd rounded-windows
 ```
 
@@ -127,7 +142,7 @@ gnome-extensions enable rounded-windows@marcosgt.github.io
 ```
 
 **Option B - GUI:**
-Open the **Extensions** app (or **GNOME Tweaks → Extensions**) and toggle _Rounded Window Corners_ on.
+Open the **Extensions** app (or **GNOME Tweaks → Extensions**) and toggle _Adaptive Rounded Corners_ on.
 
 ### 6. Open settings (optional)
 
@@ -159,9 +174,9 @@ Then restart GNOME Shell (step 4 above).
 | Smoothing | `0` = circle · `1` = squircle (superellipse) | `0.6` |
 | Clip padding | Extra gap between the window edge and the clip boundary | `1` |
 | Border width | Positive = inner border · Negative = outer · `0` = none | `0` |
-| Border colour | RGBA colour picker; doubles as the light-theme colour when theme-aware colours are on | light grey |
-| Different colours for light and dark theme | Follow the system Appearance style (only the explicit *Dark* style triggers the dark colour) | off |
-| Colour (dark theme) | RGBA colour picker used while the Appearance style is set to Dark | dark grey |
+| Border colour | RGBA colour picker (also used as the light-theme colour when theme-aware mode is enabled) | light grey |
+| Different colours for light and dark theme | Enable separate border colours for light/dark themes. Follows the system Appearance style in Settings → Appearance → Style (only the explicit *Dark* style triggers the dark colour; *Light* and default use the light colour) | off |
+| Colour (dark theme) | RGBA colour picker used when the system Appearance style is set to Dark | dark grey |
 | Keep rounded when maximised | Apply corners even when a window fills the screen | off |
 | Keep rounded when full-screen | Apply corners in full-screen mode | off |
 
@@ -259,7 +274,7 @@ Then [open a bug report](#reporting-bugs) with the full log.
 (run: journalctl -b /usr/bin/gnome-shell | grep -E "rounded-windows|JS ERROR" | tail -50)
 ```
 
-👉 [Open a new issue](https://github.com/Nathanaelrc/rounded-windows/issues/new)
+👉 [Open a new issue](https://github.com/setrios/rounded-windows/issues/new)
 
 ---
 
@@ -293,7 +308,9 @@ where `e = smoothing × 10 + 2` (2 = circle, 12 = squircle).
 
 ## Credits
 
-This extension was built by studying and adapting code from several open-source projects:
+This fork is maintained by **[setrios](https://github.com/setrios)** building on the excellent work of **Nathanaelrc**.
+
+The upstream project and this extension were built by studying and adapting code from several open-source projects:
 
 | Project | Author | What we used |
 |:--------|:-------|:-------------|

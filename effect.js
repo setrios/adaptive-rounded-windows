@@ -1,5 +1,5 @@
 /**
- * effect.js – GLSL Clutter effects for Rounded Window Corners
+ * effect.js – GLSL Clutter effects for Adaptive Rounded Corners
  *
  * IMPORTANT design rules for Shell.GLSLEffect on GNOME 50 (Mutter 18):
  *
