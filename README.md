@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/JS-ES2022-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="JavaScript">
 </p>
 
-<h1 align="center">Adaptive Rounded Corners</h1>
+<h1 align="center">Adaptive Rounded Windows Corners</h1>
 
 <p align="center">
   A GNOME Shell extension that adds <strong>adaptive rounded corners</strong> to top-level windows -<br>
